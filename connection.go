@@ -8,19 +8,16 @@ package godm
 
 import (
 	"context"
+
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type Connection interface {
-	InsertOne()
-	InsertMany()
-	Find(ctx context.Context, filter interface{}, opts interface{}) interface{}
-	FindOne()
-	FindOneAndDelete()
-	FindOneAndUpdate()
-	ReplaceOne()
-	UpdateOne()
-	UpdateMany()
-	DeleteOne()
-	DeleteMany()
-	Transaction()
+	InsertOne(ctx context.Context, doc interface{}, pipeline PipelineFn, opts *options.InsertOneOptions) error
+	Find(ctx context.Context, filter interface{}, pipeline PipelineFn, opts *options.FindOptions) error
+	FindOne(ctx context.Context, filter interface{}, pipeline PipelineFn, opts *options.FindOneOptions) error
+	FindOneAndDelete(ctx context.Context, filter interface{}, pipeline PipelineFn, opts *options.FindOneAndDeleteOptions) error
+	FindOneAndUpdate(ctx context.Context, filter, update interface{}, pipeline PipelineFn, opts *options.FindOneAndUpdateOptions) error
+	FindOneAndReplace(ctx context.Context, filter, replacement interface{}, pipeline PipelineFn, opts *options.FindOneAndReplaceOptions) error
+	Where(args ...interface{}) *Query
 }

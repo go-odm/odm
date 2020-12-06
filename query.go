@@ -7,15 +7,10 @@ Copyright 2020 RS4
 package godm
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
-
-type Options struct {
-	skip       int32
-	projection M
-	sort       M
-}
 
 func initQuery() *Query {
 	q := Query{
@@ -27,7 +22,7 @@ func initQuery() *Query {
 	return &q
 }
 
-func NewQuery() *Query {
+func NewQuery(fn ...func(query *Query)) *Query {
 	q := Query{
 		operation: "",
 		options: &Options{
@@ -37,7 +32,22 @@ func NewQuery() *Query {
 		conditions: make(M),
 		field:      "",
 	}
+	if len(fn) > 0 {
+		for _, f := range fn {
+			f(&q)
+		}
+	}
 	return &q
+}
+
+func SetConn(c Connection) func(query *Query) {
+	return func(query *Query) {
+		query.connection = c
+	}
+}
+
+func NewQueryWitConn(c Connection) *Query {
+	return NewQuery(SetConn(c))
 }
 
 type Query struct {
@@ -56,11 +66,38 @@ type Query struct {
 //	//return err
 //}
 
+func (q *Query) FindOne(ctx context.Context, pipeline PipelineFn) error {
+	return q.connection.FindOne(ctx, q.conditions, pipeline, q.options.FindOneOptions())
+}
+func (q *Query) InsertOne(ctx context.Context, pipeline PipelineFn) error {
+	return q.connection.InsertOne(ctx, q.conditions, pipeline, q.options.InsertOneOptions())
+}
+
+func (q *Query) FindOneAndDelete(ctx context.Context, pipeline PipelineFn) error {
+	return q.connection.FindOneAndDelete(ctx, q.conditions, pipeline, q.options.FindOneAndDeleteOptions())
+}
+
+func (q *Query) FindOneAndUpdateOne(ctx context.Context, update interface{}, pipeline PipelineFn) error {
+	return q.connection.FindOneAndUpdate(ctx, q.conditions, update, pipeline, q.options.FindOneAndUpdateOptions())
+}
+
+func (q *Query) FindOneAndReplace(ctx context.Context, replacement interface{}, pipeline PipelineFn) error {
+	return q.connection.FindOneAndReplace(ctx, q.conditions, replacement, pipeline, q.options.FindOneAndReplaceOptions())
+}
+
+func (q *Query) GetConditions() M {
+	return q.conditions
+}
+
 func (q *Query) GetSelect() M {
 	return q.options.projection
 }
 
-func mappingStringToFieldSets(value Input) Input {
+func mappingStringToFieldSets(value Input, projection bool) Input {
+	out := -1
+	if projection {
+		out = 0
+	}
 	obj := make(M)
 	switch value.(type) {
 	case string:
@@ -68,8 +105,7 @@ func mappingStringToFieldSets(value Input) Input {
 		for _, v := range strArray {
 			if v[0] == '-' {
 				v = v[1:]
-				//TODO: Projection 0
-				obj[v] = -1
+				obj[v] = out
 			} else {
 				obj[v] = 1
 			}
@@ -81,12 +117,12 @@ func mappingStringToFieldSets(value Input) Input {
 }
 
 func (q *Query) Sort(value interface{}) *Query {
-	q.options.sort = chain(mappingStringToFieldSets)(value).(M)
+	q.options.sort = mappingStringToFieldSets(value, false).(M)
 	return q
 }
 
 func (q *Query) Select(value interface{}) *Query {
-	q.options.projection = chain(mappingStringToFieldSets)(value).(M)
+	q.options.projection = mappingStringToFieldSets(value, true).(M)
 	return q
 }
 
@@ -94,7 +130,38 @@ func (q *Query) Skip(value int32) *Query {
 	q.options.skip = value
 	return q
 }
-func (q *Query) Where(field string) *Query {
+
+func (q *Query) Where(args ...interface{}) *Query {
+	//q.field = field
+	switch len(args) {
+	// first args is string
+	case 1:
+		if field, ok := args[0].(string); ok {
+			q.Set(field)
+		}
+		// Where("version",1) where version is equals q
+	case 2:
+		if field, ok := args[0].(string); ok {
+			q.Set(field).Eq(args[1])
+		}
+		// Where("version",">=",1) gte 1
+	case 3:
+		if field, ok := args[0].(string); ok {
+			q.Set(field)
+		}
+		if operators, ok := args[1].(string); ok {
+			q.bindCondition(
+				chain(
+					getFlagWrapperFromString(operators),
+					inputBuilder,
+				)(args[2]),
+			)
+		}
+	}
+	return q
+}
+
+func (q *Query) Set(field string) *Query {
 	q.field = field
 	return q
 }
@@ -111,6 +178,7 @@ func (q *Query) Eq(input interface{}) *Query {
 		resetField()
 	return q
 }
+
 func (q *Query) Equals(input interface{}) *Query {
 	q.
 		ensureField("Equals").
@@ -121,23 +189,30 @@ func (q *Query) Equals(input interface{}) *Query {
 	return q
 }
 
+func (q *Query) AutoBindConditions(flag string, condition interface{}) *Query {
+	if q.hasField() {
+		q.bindCondition(
+			chain(
+				inputBuilder,
+			)(condition),
+		).resetField()
+	} else {
+		q.bindCondition(
+			chain(
+				inputWrapper(flag),
+				inputBuilder,
+			)(condition),
+		).resetField()
+	}
+	return q
+}
+
 /*
 	e.g. query.Or([]M{{"name": "weny"}, {"age": "20"}})
 */
 func (q *Query) Or(value interface{}) *Query {
 	flag := "$or"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 /*
@@ -145,270 +220,94 @@ func (q *Query) Or(value interface{}) *Query {
 */
 func (q *Query) Nor(value interface{}) *Query {
 	flag := "$nor"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) And(value interface{}) *Query {
 	flag := "$and"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Not(value interface{}) *Query {
 	flag := "$not"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Gt(value interface{}) *Query {
 	flag := "$gt"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Gte(value interface{}) *Query {
 	flag := "$gte"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Lt(value interface{}) *Query {
 	flag := "$lt"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Lte(value interface{}) *Query {
 	flag := "$lte"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Ne(value interface{}) *Query {
 	flag := "$ne"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) In(value interface{}) *Query {
 	flag := "$in"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Nin(value interface{}) *Query {
 	flag := "$nin"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) All(value interface{}) *Query {
 	flag := "$all"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Regex(value interface{}) *Query {
 	flag := "$regex"
-	if q.hasField() {
-		q.bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		)
-	} else {
-		q.setField(flag).bindCondition(value)
-	}
-	q.resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Size(value interface{}) *Query {
 	flag := "$size"
-	q.ensureField(flag).
-		bindCondition(
-			chain(
-				inputWrapper(flag),
-			)(value),
-		)
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) MaxDistance(value interface{}) *Query {
 	flag := "$maxDistance"
-	q.ensureField(flag).
-		bindCondition(
-			chain(
-				inputWrapper(flag),
-			)(value),
-		)
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) MinDistance(value interface{}) *Query {
 	flag := "$minDistance"
-	q.
-		ensureField(flag).
-		bindCondition(
-			chain(
-				inputWrapper(flag),
-			)(value),
-		)
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) Mod(value interface{}) *Query {
 	flag := "$mod"
-	q.
-		ensureField(flag).
-		bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		).
-		resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 //TODO: geometry
 
 func (q *Query) Exists(value bool) *Query {
 	flag := "$exists"
-	q.ensureField(flag).
-		bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder)(value),
-		).
-		resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) ElemMatch(value interface{}) *Query {
 	flag := "$elemMatch"
-	q.
-		ensureField(flag).
-		bindCondition(
-			chain(
-				inputWrapper(flag),
-				inputBuilder,
-			)(value),
-		).
-		resetField()
-	return q
+	return q.AutoBindConditions(flag, value)
 }
 
 func (q *Query) bindCondition(value Input) *Query {
@@ -451,6 +350,23 @@ func inputWrapper(flag string) InputEndpoint {
 		return M{flag: input}
 	}
 }
+func getFlagWrapperFromString(arg string) InputEndpoint {
+	switch arg {
+	case "<":
+		return inputWrapper("$lt")
+	case ">":
+		return inputWrapper("$gt")
+	case "=":
+		return inputWrapper("$eq")
+	case ">=":
+		return inputWrapper("$gte")
+	case "<=":
+		return inputWrapper("$lte")
+	default:
+		return inputWrapper("$eq")
+	}
+}
+
 func inputBuilder(input Input) Input {
 	var res interface{}
 	switch input.(type) {
